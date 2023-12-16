@@ -11,7 +11,7 @@ import zipfile
 from pathlib import Path
 from typing import TYPE_CHECKING, List
 from urllib.parse import urlparse
-from zipimport import zipimporter
+from zipimport import ZipImportError, zipimporter
 
 import openapi_python_client
 import requests
@@ -78,12 +78,13 @@ def fetch_openai_plugins_manifest_and_spec(config: Config) -> dict:
                 if response.status_code == 200:
                     manifest = response.json()
                     if manifest["schema_version"] != "v1":
-                        logger.warn(
-                            f"Unsupported manifest version: {manifest['schem_version']} for {url}"
+                        logger.warning(
+                            "Unsupported manifest version: "
+                            f"{manifest['schem_version']} for {url}"
                         )
                         continue
                     if manifest["api"]["type"] != "openapi":
-                        logger.warn(
+                        logger.warning(
                             f"Unsupported API type: {manifest['api']['type']} for {url}"
                         )
                         continue
@@ -91,11 +92,11 @@ def fetch_openai_plugins_manifest_and_spec(config: Config) -> dict:
                         manifest, f"{openai_plugin_client_dir}/ai-plugin.json"
                     )
                 else:
-                    logger.warn(
+                    logger.warning(
                         f"Failed to fetch manifest for {url}: {response.status_code}"
                     )
             except requests.exceptions.RequestException as e:
-                logger.warn(f"Error while requesting manifest from {url}: {e}")
+                logger.warning(f"Error while requesting manifest from {url}: {e}")
         else:
             logger.info(f"Manifest for {url} already exists")
             manifest = json.load(open(f"{openai_plugin_client_dir}/ai-plugin.json"))
@@ -127,7 +128,7 @@ def create_directory_if_not_exists(directory_path: str) -> bool:
             logger.debug(f"Created directory: {directory_path}")
             return True
         except OSError as e:
-            logger.warn(f"Error creating directory {directory_path}: {e}")
+            logger.warning(f"Error creating directory {directory_path}: {e}")
             return False
     else:
         logger.info(f"Directory {directory_path} already exists")
@@ -166,7 +167,7 @@ def initialize_openai_plugins(manifests_specs: dict, config: Config) -> dict:
                     config=_config,
                 )
                 if client_results:
-                    logger.warn(
+                    logger.warning(
                         f"Error creating OpenAPI client: {client_results[0].header} \n"
                         f" details: {client_results[0].detail}"
                     )
@@ -230,14 +231,16 @@ def scan_plugins(config: Config) -> List[AutoGPTPluginTemplate]:
 
         try:
             __import__(qualified_module_name)
-        except:
+        except ImportError:
             logger.error(f"Failed to load {qualified_module_name}")
             continue
         plugin = sys.modules[qualified_module_name]
 
         if not plugins_config.is_enabled(plugin_module_name):
-            logger.warn(
-                f"Plugin folder {plugin_module_name} found but not configured. If this is a legitimate plugin, please add it to plugins_config.yaml (key: {plugin_module_name})."
+            logger.warning(
+                f"Plugin folder {plugin_module_name} found but not configured. "
+                "If this is a legitimate plugin, please add it to plugins_config.yaml "
+                f"(key: {plugin_module_name})."
             )
             continue
 
@@ -258,8 +261,9 @@ def scan_plugins(config: Config) -> List[AutoGPTPluginTemplate]:
                 zipped_package = zipimporter(str(plugin))
                 try:
                     zipped_module = zipped_package.load_module(str(module.parent))
-                except:
+                except ZipImportError:
                     logger.error(f"Failed to load {str(module.parent)}")
+                    continue
 
                 for key in dir(zipped_module):
                     if key.startswith("__"):
@@ -279,24 +283,29 @@ def scan_plugins(config: Config) -> List[AutoGPTPluginTemplate]:
 
                         if plugin_configured and plugin_enabled:
                             logger.debug(
-                                f"Loading plugin {plugin_name}. Enabled in plugins_config.yaml."
+                                f"Loading plugin {plugin_name}. "
+                                "Enabled in plugins_config.yaml."
                             )
                             loaded_plugins.append(a_module())
                         elif plugin_configured and not plugin_enabled:
                             logger.debug(
-                                f"Not loading plugin {plugin_name}. Disabled in plugins_config.yaml."
+                                f"Not loading plugin {plugin_name}. "
+                                "Disabled in plugins_config.yaml."
                             )
                         elif not plugin_configured:
-                            logger.warn(
-                                f"Not loading plugin {plugin_name}. Key '{plugin_name}' was not found in plugins_config.yaml. "
-                                f"Zipped plugins should use the class name ({plugin_name}) as the key."
+                            logger.warning(
+                                f"Not loading plugin {plugin_name}. "
+                                f"No entry for '{plugin_name}' in plugins_config.yaml. "
+                                "Note: Zipped plugins should use the class name "
+                                f"({plugin_name}) as the key."
                             )
                     else:
                         if (
                             module_name := getattr(a_module, "__name__", str(a_module))
                         ) != "AutoGPTPluginTemplate":
                             logger.debug(
-                                f"Skipping '{module_name}' because it doesn't subclass AutoGPTPluginTemplate."
+                                f"Skipping '{module_name}' because it doesn't subclass "
+                                "AutoGPTPluginTemplate."
                             )
 
     # OpenAI plugins
@@ -306,8 +315,9 @@ def scan_plugins(config: Config) -> List[AutoGPTPluginTemplate]:
             manifests_specs_clients = initialize_openai_plugins(manifests_specs, config)
             for url, openai_plugin_meta in manifests_specs_clients.items():
                 if not plugins_config.is_enabled(url):
-                    logger.warn(
-                        f"OpenAI Plugin {plugin_module_name} found but not configured"
+                    plugin_name = openai_plugin_meta["manifest"]["name_for_model"]
+                    logger.warning(
+                        f"OpenAI Plugin {plugin_name} found but not configured"
                     )
                     continue
 
