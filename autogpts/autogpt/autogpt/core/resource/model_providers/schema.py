@@ -1,7 +1,11 @@
 import abc
 import enum
+import logging
 import math
+from collections import defaultdict
 from typing import (
+    TYPE_CHECKING,
+    Any,
     Callable,
     ClassVar,
     Generic,
@@ -24,6 +28,10 @@ from autogpt.core.resource.schema import (
     ResourceType,
 )
 from autogpt.core.utils.json_schema import JSONSchema
+from autogpt.logs.utils import fmt_kwargs
+
+if TYPE_CHECKING:
+    from jsonschema import ValidationError
 
 
 class ModelProviderService(str, enum.Enum):
@@ -36,6 +44,7 @@ class ModelProviderService(str, enum.Enum):
 
 class ModelProviderName(str, enum.Enum):
     OPENAI = "openai"
+    ANTHROPIC = "anthropic"
 
 
 class ChatMessage(BaseModel):
@@ -68,12 +77,15 @@ class ChatMessageDict(TypedDict):
 
 class AssistantFunctionCall(BaseModel):
     name: str
-    arguments: str
+    arguments: dict[str, Any]
+
+    def __str__(self) -> str:
+        return f"{self.name}({fmt_kwargs(self.arguments)})"
 
 
 class AssistantFunctionCallDict(TypedDict):
     name: str
-    arguments: str
+    arguments: dict[str, Any]
 
 
 class AssistantToolCall(BaseModel):
@@ -89,9 +101,15 @@ class AssistantToolCallDict(TypedDict):
 
 
 class AssistantChatMessage(ChatMessage):
-    role: Literal["assistant"] = "assistant"
+    role: Literal[ChatMessage.Role.ASSISTANT] = ChatMessage.Role.ASSISTANT
     content: Optional[str]
     tool_calls: Optional[list[AssistantToolCall]] = None
+
+
+class ToolResultMessage(ChatMessage):
+    role: Literal[ChatMessage.Role.TOOL] = ChatMessage.Role.TOOL
+    is_error: bool = False
+    tool_call_id: str
 
 
 class AssistantChatMessageDict(TypedDict, total=False):
@@ -140,6 +158,30 @@ class CompletionModelFunction(BaseModel):
         )
         return f"{self.name}: {self.description}. Params: ({params})"
 
+    def validate_call(
+        self, function_call: AssistantFunctionCall
+    ) -> tuple[bool, list["ValidationError"]]:
+        """
+        Validates the given function call against the function's parameter specs
+
+        Returns:
+            bool: Whether the given set of arguments is valid for this command
+            list[ValidationError]: Issues with the set of arguments (if any)
+
+        Raises:
+            ValueError: If the function_call doesn't call this function
+        """
+        if function_call.name != self.name:
+            raise ValueError(
+                f"Can't validate {function_call.name} call using {self.name} spec"
+            )
+
+        params_schema = JSONSchema(
+            type=JSONSchema.Type.OBJECT,
+            properties={name: spec for name, spec in self.parameters.items()},
+        )
+        return params_schema.validate_object(function_call.arguments)
+
 
 class ModelInfo(BaseModel):
     """Struct for model information.
@@ -186,39 +228,34 @@ class ModelProviderUsage(ProviderUsage):
 
     completion_tokens: int = 0
     prompt_tokens: int = 0
-    total_tokens: int = 0
 
     def update_usage(
         self,
-        model_response: ModelResponse,
+        input_tokens_used: int,
+        output_tokens_used: int = 0,
     ) -> None:
-        self.completion_tokens += model_response.completion_tokens_used
-        self.prompt_tokens += model_response.prompt_tokens_used
-        self.total_tokens += (
-            model_response.completion_tokens_used + model_response.prompt_tokens_used
-        )
+        self.prompt_tokens += input_tokens_used
+        self.completion_tokens += output_tokens_used
 
 
 class ModelProviderBudget(ProviderBudget):
-    total_budget: float = UserConfigurable()
-    total_cost: float
-    remaining_budget: float
-    usage: ModelProviderUsage
+    usage: defaultdict[str, ModelProviderUsage] = defaultdict(ModelProviderUsage)
 
     def update_usage_and_cost(
         self,
-        model_response: ModelResponse,
+        model_info: ModelInfo,
+        input_tokens_used: int,
+        output_tokens_used: int = 0,
     ) -> float:
         """Update the usage and cost of the provider.
 
         Returns:
             float: The (calculated) cost of the given model response.
         """
-        model_info = model_response.model_info
-        self.usage.update_usage(model_response)
+        self.usage[model_info.name].update_usage(input_tokens_used, output_tokens_used)
         incurred_cost = (
-            model_response.completion_tokens_used * model_info.completion_token_cost
-            + model_response.prompt_tokens_used * model_info.prompt_token_cost
+            output_tokens_used * model_info.completion_token_cost
+            + input_tokens_used * model_info.prompt_token_cost
         )
         self.total_cost += incurred_cost
         self.remaining_budget -= incurred_cost
@@ -228,8 +265,8 @@ class ModelProviderBudget(ProviderBudget):
 class ModelProviderSettings(ProviderSettings):
     resource_type: ResourceType = ResourceType.MODEL
     configuration: ModelProviderConfiguration
-    credentials: ModelProviderCredentials
-    budget: ModelProviderBudget
+    credentials: Optional[ModelProviderCredentials] = None
+    budget: Optional[ModelProviderBudget] = None
 
 
 class ModelProvider(abc.ABC):
@@ -237,8 +274,27 @@ class ModelProvider(abc.ABC):
 
     default_settings: ClassVar[ModelProviderSettings]
 
-    _budget: Optional[ModelProviderBudget]
+    _settings: ModelProviderSettings
     _configuration: ModelProviderConfiguration
+    _credentials: Optional[ModelProviderCredentials] = None
+    _budget: Optional[ModelProviderBudget] = None
+
+    _logger: logging.Logger
+
+    def __init__(
+        self,
+        settings: Optional[ModelProviderSettings] = None,
+        logger: Optional[logging.Logger] = None,
+    ):
+        if not settings:
+            settings = self.default_settings.copy(deep=True)
+
+        self._settings = settings
+        self._configuration = settings.configuration
+        self._credentials = settings.credentials
+        self._budget = settings.budget
+
+        self._logger = logger or logging.getLogger(self.__module__)
 
     @abc.abstractmethod
     def count_tokens(self, text: str, model_name: str) -> int:
@@ -283,7 +339,7 @@ class ModelTokenizer(Protocol):
 class EmbeddingModelInfo(ModelInfo):
     """Struct for embedding model information."""
 
-    llm_service = ModelProviderService.EMBEDDING
+    service: Literal[ModelProviderService.EMBEDDING] = ModelProviderService.EMBEDDING
     max_tokens: int
     embedding_dimensions: int
 
@@ -321,7 +377,7 @@ class EmbeddingModelProvider(ModelProvider):
 class ChatModelInfo(ModelInfo):
     """Struct for language model information."""
 
-    llm_service = ModelProviderService.CHAT
+    service: Literal[ModelProviderService.CHAT] = ModelProviderService.CHAT
     max_tokens: int
     has_function_call_api: bool = False
 
@@ -338,6 +394,10 @@ class ChatModelResponse(ModelResponse, Generic[_T]):
 
 class ChatModelProvider(ModelProvider):
     @abc.abstractmethod
+    async def get_available_models(self) -> list[ChatModelInfo]:
+        ...
+
+    @abc.abstractmethod
     def count_message_tokens(
         self,
         messages: ChatMessage | list[ChatMessage],
@@ -352,6 +412,8 @@ class ChatModelProvider(ModelProvider):
         model_name: str,
         completion_parser: Callable[[AssistantChatMessage], _T] = lambda _: None,
         functions: Optional[list[CompletionModelFunction]] = None,
+        max_output_tokens: Optional[int] = None,
+        prefill_response: str = "",
         **kwargs,
     ) -> ChatModelResponse[_T]:
         ...

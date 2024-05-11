@@ -8,7 +8,6 @@ from __future__ import annotations
 import contextlib
 import inspect
 import logging
-import os
 from io import IOBase, TextIOWrapper
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal, Optional
@@ -29,9 +28,7 @@ logger = logging.getLogger(__name__)
 
 class S3FileStorageConfiguration(FileStorageConfiguration):
     bucket: str = UserConfigurable("autogpt", from_env="STORAGE_BUCKET")
-    s3_endpoint_url: Optional[SecretStr] = UserConfigurable(
-        from_env=lambda: SecretStr(v) if (v := os.getenv("S3_ENDPOINT_URL")) else None
-    )
+    s3_endpoint_url: Optional[SecretStr] = UserConfigurable(from_env="S3_ENDPOINT_URL")
 
 
 class S3FileStorage(FileStorage):

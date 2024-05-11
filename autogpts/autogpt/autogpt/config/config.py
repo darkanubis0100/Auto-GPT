@@ -7,9 +7,8 @@ import re
 from pathlib import Path
 from typing import Any, Optional, Union
 
-from auto_gpt_plugin_template import AutoGPTPluginTemplate
 from colorama import Fore
-from pydantic import Field, SecretStr, validator
+from pydantic import SecretStr, validator
 
 import autogpt
 from autogpt.app.utils import clean_input
@@ -18,13 +17,13 @@ from autogpt.core.configuration.schema import (
     SystemSettings,
     UserConfigurable,
 )
+from autogpt.core.resource.model_providers import CHAT_MODELS, ModelName
 from autogpt.core.resource.model_providers.openai import (
-    OPEN_AI_CHAT_MODELS,
     OpenAICredentials,
+    OpenAIModelName,
 )
 from autogpt.file_storage import FileStorageBackendName
 from autogpt.logs.config import LoggingConfig
-from autogpt.plugins.plugins_config import PluginsConfig
 from autogpt.speech import TTSConfig
 
 logger = logging.getLogger(__name__)
@@ -32,11 +31,10 @@ logger = logging.getLogger(__name__)
 PROJECT_ROOT = Path(autogpt.__file__).parent.parent
 AI_SETTINGS_FILE = Path("ai_settings.yaml")
 AZURE_CONFIG_FILE = Path("azure.yaml")
-PLUGINS_CONFIG_FILE = Path("plugins_config.yaml")
 PROMPT_SETTINGS_FILE = Path("prompt_settings.yaml")
 
-GPT_4_MODEL = "gpt-4"
-GPT_3_MODEL = "gpt-3.5-turbo"
+GPT_4_MODEL = OpenAIModelName.GPT4
+GPT_3_MODEL = OpenAIModelName.GPT3
 
 
 class Config(SystemSettings, arbitrary_types_allowed=True):
@@ -53,20 +51,14 @@ class Config(SystemSettings, arbitrary_types_allowed=True):
     authorise_key: str = UserConfigurable(default="y", from_env="AUTHORISE_COMMAND_KEY")
     exit_key: str = UserConfigurable(default="n", from_env="EXIT_KEY")
     noninteractive_mode: bool = False
-    chat_messages_enabled: bool = UserConfigurable(
-        default=True, from_env=lambda: os.getenv("CHAT_MESSAGES_ENABLED") == "True"
-    )
 
     # TTS configuration
-    tts_config: TTSConfig = TTSConfig()
     logging: LoggingConfig = LoggingConfig()
+    tts_config: TTSConfig = TTSConfig()
 
     # File storage
     file_storage_backend: FileStorageBackendName = UserConfigurable(
-        default=FileStorageBackendName.LOCAL,
-        from_env=lambda: FileStorageBackendName(v)
-        if (v := os.getenv("FILE_STORAGE_BACKEND"))
-        else None,
+        default=FileStorageBackendName.LOCAL, from_env="FILE_STORAGE_BACKEND"
     )
 
     ##########################
@@ -74,27 +66,23 @@ class Config(SystemSettings, arbitrary_types_allowed=True):
     ##########################
     # Paths
     ai_settings_file: Path = UserConfigurable(
-        default=AI_SETTINGS_FILE,
-        from_env=lambda: Path(f) if (f := os.getenv("AI_SETTINGS_FILE")) else None,
+        default=AI_SETTINGS_FILE, from_env="AI_SETTINGS_FILE"
     )
     prompt_settings_file: Path = UserConfigurable(
         default=PROMPT_SETTINGS_FILE,
-        from_env=lambda: Path(f) if (f := os.getenv("PROMPT_SETTINGS_FILE")) else None,
+        from_env="PROMPT_SETTINGS_FILE",
     )
 
     # Model configuration
-    fast_llm: str = UserConfigurable(
-        default="gpt-3.5-turbo-0125",
-        from_env=lambda: os.getenv("FAST_LLM"),
+    fast_llm: ModelName = UserConfigurable(
+        default=OpenAIModelName.GPT3,
+        from_env="FAST_LLM",
     )
-    smart_llm: str = UserConfigurable(
-        default="gpt-4-turbo-preview",
-        from_env=lambda: os.getenv("SMART_LLM"),
+    smart_llm: ModelName = UserConfigurable(
+        default=OpenAIModelName.GPT4_TURBO,
+        from_env="SMART_LLM",
     )
-    temperature: float = UserConfigurable(
-        default=0,
-        from_env=lambda: float(v) if (v := os.getenv("TEMPERATURE")) else None,
-    )
+    temperature: float = UserConfigurable(default=0, from_env="TEMPERATURE")
     openai_functions: bool = UserConfigurable(
         default=False, from_env=lambda: os.getenv("OPENAI_FUNCTIONS", "False") == "True"
     )
@@ -115,10 +103,7 @@ class Config(SystemSettings, arbitrary_types_allowed=True):
     memory_backend: str = UserConfigurable("json_file", from_env="MEMORY_BACKEND")
     memory_index: str = UserConfigurable("auto-gpt-memory", from_env="MEMORY_INDEX")
     redis_host: str = UserConfigurable("localhost", from_env="REDIS_HOST")
-    redis_port: int = UserConfigurable(
-        default=6379,
-        from_env=lambda: int(v) if (v := os.getenv("REDIS_PORT")) else None,
-    )
+    redis_port: int = UserConfigurable(default=6379, from_env="REDIS_PORT")
     redis_password: str = UserConfigurable("", from_env="REDIS_PASSWORD")
     wipe_redis_on_start: bool = UserConfigurable(
         default=True,
@@ -129,9 +114,9 @@ class Config(SystemSettings, arbitrary_types_allowed=True):
     # Commands #
     ############
     # General
-    disabled_command_categories: list[str] = UserConfigurable(
+    disabled_commands: list[str] = UserConfigurable(
         default_factory=list,
-        from_env=lambda: _safe_split(os.getenv("DISABLED_COMMAND_CATEGORIES")),
+        from_env=lambda: _safe_split(os.getenv("DISABLED_COMMANDS")),
     )
 
     # File ops
@@ -170,10 +155,7 @@ class Config(SystemSettings, arbitrary_types_allowed=True):
     sd_webui_url: Optional[str] = UserConfigurable(
         default="http://localhost:7860", from_env="SD_WEBUI_URL"
     )
-    image_size: int = UserConfigurable(
-        default=256,
-        from_env=lambda: int(v) if (v := os.getenv("IMAGE_SIZE")) else None,
-    )
+    image_size: int = UserConfigurable(default=256, from_env="IMAGE_SIZE")
 
     # Audio to text
     audio_to_text_provider: str = UserConfigurable(
@@ -193,38 +175,13 @@ class Config(SystemSettings, arbitrary_types_allowed=True):
         from_env="USER_AGENT",
     )
 
-    ###################
-    # Plugin Settings #
-    ###################
-    plugins_dir: str = UserConfigurable("plugins", from_env="PLUGINS_DIR")
-    plugins_config_file: Path = UserConfigurable(
-        default=PLUGINS_CONFIG_FILE,
-        from_env=lambda: Path(f) if (f := os.getenv("PLUGINS_CONFIG_FILE")) else None,
-    )
-    plugins_config: PluginsConfig = Field(
-        default_factory=lambda: PluginsConfig(plugins={})
-    )
-    plugins: list[AutoGPTPluginTemplate] = Field(default_factory=list, exclude=True)
-    plugins_allowlist: list[str] = UserConfigurable(
-        default_factory=list,
-        from_env=lambda: _safe_split(os.getenv("ALLOWLISTED_PLUGINS")),
-    )
-    plugins_denylist: list[str] = UserConfigurable(
-        default_factory=list,
-        from_env=lambda: _safe_split(os.getenv("DENYLISTED_PLUGINS")),
-    )
-    plugins_openai: list[str] = UserConfigurable(
-        default_factory=list, from_env=lambda: _safe_split(os.getenv("OPENAI_PLUGINS"))
-    )
-
     ###############
     # Credentials #
     ###############
     # OpenAI
     openai_credentials: Optional[OpenAICredentials] = None
     azure_config_file: Optional[Path] = UserConfigurable(
-        default=AZURE_CONFIG_FILE,
-        from_env=lambda: Path(f) if (f := os.getenv("AZURE_CONFIG_FILE")) else None,
+        default=AZURE_CONFIG_FILE, from_env="AZURE_CONFIG_FILE"
     )
 
     # Github
@@ -234,7 +191,7 @@ class Config(SystemSettings, arbitrary_types_allowed=True):
     # Google
     google_api_key: Optional[str] = UserConfigurable(from_env="GOOGLE_API_KEY")
     google_custom_search_engine_id: Optional[str] = UserConfigurable(
-        from_env=lambda: os.getenv("GOOGLE_CUSTOM_SEARCH_ENGINE_ID"),
+        from_env="GOOGLE_CUSTOM_SEARCH_ENGINE_ID",
     )
 
     # Huggingface
@@ -245,22 +202,12 @@ class Config(SystemSettings, arbitrary_types_allowed=True):
     # Stable Diffusion
     sd_webui_auth: Optional[str] = UserConfigurable(from_env="SD_WEBUI_AUTH")
 
-    @validator("plugins", each_item=True)
-    def validate_plugins(cls, p: AutoGPTPluginTemplate | Any):
-        assert issubclass(
-            p.__class__, AutoGPTPluginTemplate
-        ), f"{p} does not subclass AutoGPTPluginTemplate"
-        assert (
-            p.__class__.__name__ != "AutoGPTPluginTemplate"
-        ), f"Plugins must subclass AutoGPTPluginTemplate; {p} is a template instance"
-        return p
-
     @validator("openai_functions")
     def validate_openai_functions(cls, v: bool, values: dict[str, Any]):
         if v:
             smart_llm = values["smart_llm"]
-            assert OPEN_AI_CHAT_MODELS[smart_llm].has_function_call_api, (
-                f"Model {smart_llm} does not support OpenAI Functions. "
+            assert CHAT_MODELS[smart_llm].has_function_call_api, (
+                f"Model {smart_llm} does not support tool calling. "
                 "Please disable OPENAI_FUNCTIONS or choose a suitable model."
             )
         return v
@@ -280,7 +227,6 @@ class ConfigBuilder(Configurable[Config]):
         for k in {
             "ai_settings_file",  # TODO: deprecate or repurpose
             "prompt_settings_file",  # TODO: deprecate or repurpose
-            "plugins_config_file",  # TODO: move from project root
             "azure_config_file",  # TODO: move from project root
         }:
             setattr(config, k, project_root / getattr(config, k))
@@ -292,18 +238,12 @@ class ConfigBuilder(Configurable[Config]):
         ):
             config.openai_credentials.load_azure_config(config_file)
 
-        config.plugins_config = PluginsConfig.load_config(
-            config.plugins_config_file,
-            config.plugins_denylist,
-            config.plugins_allowlist,
-        )
-
         return config
 
 
 def assert_config_has_openai_api_key(config: Config) -> None:
     """Check if the OpenAI API key is set in config.py or as an environment variable."""
-    key_pattern = r"^sk-\w{48}"
+    key_pattern = r"^sk-(proj-)?\w{48}"
     openai_api_key = (
         config.openai_credentials.api_key.get_secret_value()
         if config.openai_credentials
