@@ -1,70 +1,33 @@
 from abc import ABC, abstractmethod
+from enum import Enum
 from typing import Any, ClassVar, Generator, Generic, Type, TypeVar, cast
 
 import jsonref
 import jsonschema
 from prisma.models import AgentBlock
-from pydantic import BaseModel, GetCoreSchemaHandler
-from pydantic_core import CoreSchema, core_schema
+from pydantic import BaseModel
 
+from autogpt_server.data.model import ContributorDetails
 from autogpt_server.util import json
-from autogpt_server.util.settings import Secrets
 
-BlockInput = dict[str, Any]
-BlockData = tuple[str, Any]
-BlockOutput = Generator[BlockData, None, None]
+BlockData = tuple[str, Any]  # Input & Output data should be a tuple of (name, data).
+BlockInput = dict[str, Any]  # Input: 1 input pin consumes 1 data.
+BlockOutput = Generator[BlockData, None, None]  # Output: 1 output pin produces n data.
+CompletedBlockOutput = dict[str, list[Any]]  # Completed stream, collected as a dict.
 
 
-class BlockFieldSecret:
-    def __init__(self, value=None, key=None):
-        self._value = value or self.__get_secret(key)
-        if self._value is None:
-            raise ValueError(f"Secret {key} not found.")
+class BlockCategory(Enum):
+    AI = "Block that leverages AI to perform a task."
+    SOCIAL = "Block that interacts with social media platforms."
+    TEXT = "Block that processes text data."
+    SEARCH = "Block that searches or extracts information from the internet."
+    BASIC = "Block that performs basic operations."
+    INPUT = "Block that interacts with input of the graph."
+    OUTPUT = "Block that interacts with output of the graph."
+    LOGIC = "Programming logic to control the flow of your agent"
 
-    STR: ClassVar[str] = "<secret>"
-    SECRETS: ClassVar[Secrets] = Secrets()
-
-    def __repr__(self):
-        return BlockFieldSecret.STR
-
-    def __str__(self):
-        return BlockFieldSecret.STR
-
-    @staticmethod
-    def __get_secret(key: str | None):
-        if not key or not hasattr(BlockFieldSecret.SECRETS, key):
-            return None
-        return getattr(BlockFieldSecret.SECRETS, key)
-
-    def get(self):
-        return str(self._value)
-
-    @classmethod
-    def parse_value(cls, value: Any) -> "BlockFieldSecret":
-        if isinstance(value, BlockFieldSecret):
-            return value
-        return BlockFieldSecret(value=value)
-    
-    @classmethod
-    def __get_pydantic_json_schema__(
-            cls, source_type: Any, handler: GetCoreSchemaHandler) -> dict[str, Any]:
-        return {
-            "type": "string",
-            "title": "BlockFieldSecret",
-            "description": "A secret field",
-        }
-
-    @classmethod
-    def __get_pydantic_core_schema__(
-            cls, source_type: Any, handler: GetCoreSchemaHandler) -> CoreSchema:
-        validate_fun = core_schema.no_info_plain_validator_function(cls.parse_value)
-        return core_schema.json_or_python_schema(
-            json_schema=validate_fun,
-            python_schema=validate_fun,
-            serialization=core_schema.plain_serializer_function_ser_schema(
-                lambda val: BlockFieldSecret.STR
-            ),
-        )
+    def dict(self) -> dict[str, str]:
+        return {"category": self.name, "description": self.value}
 
 
 class BlockSchema(BaseModel):
@@ -153,26 +116,35 @@ class EmptySchema(BlockSchema):
 
 class Block(ABC, Generic[BlockSchemaInputType, BlockSchemaOutputType]):
     def __init__(
-            self,
-            id: str = "",
-            input_schema: Type[BlockSchemaInputType] = EmptySchema,
-            output_schema: Type[BlockSchemaOutputType] = EmptySchema,
-            test_input: BlockInput | list[BlockInput] | None = None,
-            test_output: BlockData | list[BlockData] | None = None,
-            test_mock: dict[str, Any] | None = None,
+        self,
+        id: str = "",
+        description: str = "",
+        contributors: list[ContributorDetails] = [],
+        categories: set[BlockCategory] | None = None,
+        input_schema: Type[BlockSchemaInputType] = EmptySchema,
+        output_schema: Type[BlockSchemaOutputType] = EmptySchema,
+        test_input: BlockInput | list[BlockInput] | None = None,
+        test_output: BlockData | list[BlockData] | None = None,
+        test_mock: dict[str, Any] | None = None,
+        disabled: bool = False,
+        static_output: bool = False,
     ):
         """
         Initialize the block with the given schema.
-        
+
         Args:
             id: The unique identifier for the block, this value will be persisted in the
                 DB. So it should be a unique and constant across the application run.
                 Use the UUID format for the ID.
+            description: The description of the block, explaining what the block does.
+            contributors: The list of contributors who contributed to the block.
             input_schema: The schema, defined as a Pydantic model, for the input data.
             output_schema: The schema, defined as a Pydantic model, for the output data.
             test_input: The list or single sample input data for the block, for testing.
             test_output: The list or single expected output if the test_input is run.
             test_mock: function names on the block implementation to mock on test run.
+            disabled: If the block is disabled, it will not be available for execution.
+            static_output: Whether the output links of the block are static by default.
         """
         self.id = id
         self.input_schema = input_schema
@@ -180,6 +152,11 @@ class Block(ABC, Generic[BlockSchemaInputType, BlockSchemaOutputType]):
         self.test_input = test_input
         self.test_output = test_output
         self.test_mock = test_mock
+        self.description = description
+        self.categories = categories or set()
+        self.contributors = contributors or set()
+        self.disabled = disabled
+        self.static_output = static_output
 
     @abstractmethod
     def run(self, input_data: BlockSchemaInputType) -> BlockOutput:
@@ -204,6 +181,12 @@ class Block(ABC, Generic[BlockSchemaInputType, BlockSchemaOutputType]):
             "name": self.name,
             "inputSchema": self.input_schema.jsonschema(),
             "outputSchema": self.output_schema.jsonschema(),
+            "description": self.description,
+            "categories": [category.dict() for category in self.categories],
+            "contributors": [
+                contributor.model_dump() for contributor in self.contributors
+            ],
+            "staticOutput": self.static_output,
         }
 
     def execute(self, input_data: BlockInput) -> BlockOutput:
@@ -220,24 +203,42 @@ class Block(ABC, Generic[BlockSchemaInputType, BlockSchemaOutputType]):
 
 # ======================= Block Helper Functions ======================= #
 
+
 def get_blocks() -> dict[str, Block]:
     from autogpt_server.blocks import AVAILABLE_BLOCKS  # noqa: E402
+
     return AVAILABLE_BLOCKS
 
 
 async def initialize_blocks() -> None:
     for block in get_blocks().values():
-        if await AgentBlock.prisma().find_unique(where={"id": block.id}):
+        existing_block = await AgentBlock.prisma().find_unique(where={"id": block.id})
+        if not existing_block:
+            await AgentBlock.prisma().create(
+                data={
+                    "id": block.id,
+                    "name": block.name,
+                    "inputSchema": json.dumps(block.input_schema.jsonschema()),
+                    "outputSchema": json.dumps(block.output_schema.jsonschema()),
+                }
+            )
             continue
 
-        await AgentBlock.prisma().create(
-            data={
-                "id": block.id,
-                "name": block.name,
-                "inputSchema": json.dumps(block.input_schema.jsonschema()),
-                "outputSchema": json.dumps(block.output_schema.jsonschema()),
-            }
-        )
+        input_schema = json.dumps(block.input_schema.jsonschema())
+        output_schema = json.dumps(block.output_schema.jsonschema())
+        if (
+            block.name != existing_block.name
+            or input_schema != existing_block.inputSchema
+            or output_schema != existing_block.outputSchema
+        ):
+            await AgentBlock.prisma().update(
+                where={"id": block.id},
+                data={
+                    "name": block.name,
+                    "inputSchema": input_schema,
+                    "outputSchema": output_schema,
+                },
+            )
 
 
 def get_block(block_id: str) -> Block | None:
