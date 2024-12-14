@@ -20,14 +20,24 @@ import { ClockIcon, ExitIcon, Pencil2Icon } from "@radix-ui/react-icons";
 import Link from "next/link";
 import { exportAsJSONFile } from "@/lib/utils";
 import { FlowRunsStats } from "@/components/monitor/index";
+import { Trash2Icon } from "lucide-react";
+import {
+  Dialog,
+  DialogContent,
+  DialogHeader,
+  DialogTitle,
+  DialogDescription,
+  DialogFooter,
+} from "@/components/ui/dialog";
 
 export const FlowInfo: React.FC<
   React.HTMLAttributes<HTMLDivElement> & {
     flow: GraphMeta;
     flowRuns: FlowRun[];
     flowVersion?: number | "all";
+    refresh: () => void;
   }
-> = ({ flow, flowRuns, flowVersion, ...props }) => {
+> = ({ flow, flowRuns, flowVersion, refresh, ...props }) => {
   const api = useMemo(() => new AutoGPTServerAPI(), []);
 
   const [flowVersions, setFlowVersions] = useState<Graph[] | null>(null);
@@ -38,6 +48,8 @@ export const FlowInfo: React.FC<
     (v) =>
       v.version == (selectedVersion == "all" ? flow.version : selectedVersion),
   );
+
+  const [isDeleteModalOpen, setIsDeleteModalOpen] = useState(false);
 
   useEffect(() => {
     api.getGraphAllVersions(flow.id).then((result) => setFlowVersions(result));
@@ -93,10 +105,11 @@ export const FlowInfo: React.FC<
             </DropdownMenu>
           )}
           <Link
-            className={buttonVariants({ variant: "outline" })}
+            className={buttonVariants({ variant: "default" })}
             href={`/build?flowID=${flow.id}`}
           >
-            <Pencil2Icon className="mr-2" /> Edit
+            <Pencil2Icon className="mr-2" />
+            Open in Builder
           </Link>
           <Button
             variant="outline"
@@ -114,7 +127,10 @@ export const FlowInfo: React.FC<
               )
             }
           >
-            <ExitIcon />
+            <ExitIcon className="mr-2" /> Export
+          </Button>
+          <Button variant="outline" onClick={() => setIsDeleteModalOpen(true)}>
+            <Trash2Icon className="h-full" />
           </Button>
         </div>
       </CardHeader>
@@ -128,6 +144,36 @@ export const FlowInfo: React.FC<
           )}
         />
       </CardContent>
+      <Dialog open={isDeleteModalOpen} onOpenChange={setIsDeleteModalOpen}>
+        <DialogContent>
+          <DialogHeader>
+            <DialogTitle>Delete Agent</DialogTitle>
+            <DialogDescription>
+              Are you sure you want to delete this agent? <br />
+              This action cannot be undone.
+            </DialogDescription>
+          </DialogHeader>
+          <DialogFooter>
+            <Button
+              variant="outline"
+              onClick={() => setIsDeleteModalOpen(false)}
+            >
+              Cancel
+            </Button>
+            <Button
+              variant="destructive"
+              onClick={() => {
+                api.deleteGraph(flow.id).then(() => {
+                  setIsDeleteModalOpen(false);
+                  refresh();
+                });
+              }}
+            >
+              Delete
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
     </Card>
   );
 };

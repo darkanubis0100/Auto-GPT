@@ -1,19 +1,23 @@
 import { SupabaseClient } from "@supabase/supabase-js";
 import {
-  AnalyticsMetrics,
   AnalyticsDetails,
+  AnalyticsMetrics,
   APIKeyCredentials,
   Block,
+  CredentialsDeleteNeedConfirmationResponse,
+  CredentialsDeleteResponse,
   CredentialsMetaResponse,
+  ExecutionMeta,
   Graph,
   GraphCreatable,
-  GraphUpdateable,
+  GraphExecuteResponse,
   GraphMeta,
   GraphMetaWithRuns,
-  GraphExecuteResponse,
-  ExecutionMeta,
+  GraphUpdateable,
   NodeExecutionResult,
   OAuth2Credentials,
+  Schedule,
+  ScheduleCreatable,
   User,
 } from "./types";
 
@@ -24,10 +28,14 @@ export default class BaseAutoGPTServerAPI {
   private wsConnecting: Promise<void> | null = null;
   private wsMessageHandlers: Record<string, Set<(data: any) => void>> = {};
   private supabaseClient: SupabaseClient | null = null;
+  heartbeatInterval: number | null = null;
+  readonly HEARTBEAT_INTERVAL = 30000; // 30 seconds
+  readonly HEARTBEAT_TIMEOUT = 10000; // 10 seconds
+  heartbeatTimeoutId: number | null = null;
 
   constructor(
     baseUrl: string = process.env.NEXT_PUBLIC_AGPT_SERVER_URL ||
-      "http://localhost:8006/api",
+      "http://localhost:8006/api/v1",
     wsUrl: string = process.env.NEXT_PUBLIC_AGPT_WS_SERVER_URL ||
       "ws://localhost:8001/ws",
     supabaseClient: SupabaseClient | null = null,
@@ -45,19 +53,19 @@ export default class BaseAutoGPTServerAPI {
     return session != null;
   }
 
-  async createUser(): Promise<User> {
+  createUser(): Promise<User> {
     return this._request("POST", "/auth/user", {});
   }
 
-  async getUserCredit(): Promise<{ credits: number }> {
+  getUserCredit(): Promise<{ credits: number }> {
     return this._get(`/credits`);
   }
 
-  async getBlocks(): Promise<Block[]> {
-    return await this._get("/blocks");
+  getBlocks(): Promise<Block[]> {
+    return this._get("/blocks");
   }
 
-  async listGraphs(): Promise<GraphMeta[]> {
+  listGraphs(): Promise<GraphMeta[]> {
     return this._get(`/graphs`);
   }
 
@@ -66,34 +74,41 @@ export default class BaseAutoGPTServerAPI {
     return graphs.map(parseGraphMetaWithRuns);
   }
 
-  async listTemplates(): Promise<GraphMeta[]> {
+  listTemplates(): Promise<GraphMeta[]> {
     return this._get("/templates");
   }
 
-  async getGraph(id: string, version?: number): Promise<Graph> {
-    const query = version !== undefined ? `?version=${version}` : "";
-    return this._get(`/graphs/${id}` + query);
+  getGraph(
+    id: string,
+    version?: number,
+    hide_credentials?: boolean,
+  ): Promise<Graph> {
+    let query: Record<string, any> = {};
+    if (version !== undefined) {
+      query["version"] = version;
+    }
+    if (hide_credentials !== undefined) {
+      query["hide_credentials"] = hide_credentials;
+    }
+    return this._get(`/graphs/${id}`, query);
   }
 
-  async getTemplate(id: string, version?: number): Promise<Graph> {
+  getTemplate(id: string, version?: number): Promise<Graph> {
     const query = version !== undefined ? `?version=${version}` : "";
     return this._get(`/templates/${id}` + query);
   }
 
-  async getGraphAllVersions(id: string): Promise<Graph[]> {
+  getGraphAllVersions(id: string): Promise<Graph[]> {
     return this._get(`/graphs/${id}/versions`);
   }
 
-  async getTemplateAllVersions(id: string): Promise<Graph[]> {
+  getTemplateAllVersions(id: string): Promise<Graph[]> {
     return this._get(`/templates/${id}/versions`);
   }
 
-  async createGraph(graphCreateBody: GraphCreatable): Promise<Graph>;
-  async createGraph(
-    fromTemplateID: string,
-    templateVersion: number,
-  ): Promise<Graph>;
-  async createGraph(
+  createGraph(graphCreateBody: GraphCreatable): Promise<Graph>;
+  createGraph(fromTemplateID: string, templateVersion: number): Promise<Graph>;
+  createGraph(
     graphOrTemplateID: GraphCreatable | string,
     templateVersion?: number,
   ): Promise<Graph> {
@@ -114,36 +129,37 @@ export default class BaseAutoGPTServerAPI {
     return this._request("POST", "/graphs", requestBody);
   }
 
-  async createTemplate(templateCreateBody: GraphCreatable): Promise<Graph> {
+  createTemplate(templateCreateBody: GraphCreatable): Promise<Graph> {
     const requestBody: GraphCreateRequestBody = { graph: templateCreateBody };
     return this._request("POST", "/templates", requestBody);
   }
 
-  async updateGraph(id: string, graph: GraphUpdateable): Promise<Graph> {
-    return await this._request("PUT", `/graphs/${id}`, graph);
+  updateGraph(id: string, graph: GraphUpdateable): Promise<Graph> {
+    return this._request("PUT", `/graphs/${id}`, graph);
   }
 
-  async updateTemplate(id: string, template: GraphUpdateable): Promise<Graph> {
-    return await this._request("PUT", `/templates/${id}`, template);
+  updateTemplate(id: string, template: GraphUpdateable): Promise<Graph> {
+    return this._request("PUT", `/templates/${id}`, template);
   }
 
-  async setGraphActiveVersion(id: string, version: number): Promise<Graph> {
+  deleteGraph(id: string): Promise<void> {
+    return this._request("DELETE", `/graphs/${id}`);
+  }
+
+  setGraphActiveVersion(id: string, version: number): Promise<Graph> {
     return this._request("PUT", `/graphs/${id}/versions/active`, {
       active_graph_version: version,
     });
   }
 
-  async executeGraph(
+  executeGraph(
     id: string,
     inputData: { [key: string]: any } = {},
   ): Promise<GraphExecuteResponse> {
     return this._request("POST", `/graphs/${id}/execute`, inputData);
   }
 
-  async listGraphRunIDs(
-    graphID: string,
-    graphVersion?: number,
-  ): Promise<string[]> {
+  listGraphRunIDs(graphID: string, graphVersion?: number): Promise<string[]> {
     const query =
       graphVersion !== undefined ? `?graph_version=${graphVersion}` : "";
     return this._get(`/graphs/${graphID}/executions` + query);
@@ -167,15 +183,15 @@ export default class BaseAutoGPTServerAPI {
     ).map(parseNodeExecutionResultTimestamps);
   }
 
-  async oAuthLogin(
+  oAuthLogin(
     provider: string,
     scopes?: string[],
   ): Promise<{ login_url: string; state_token: string }> {
     const query = scopes ? { scopes: scopes.join(",") } : undefined;
-    return await this._get(`/integrations/${provider}/login`, query);
+    return this._get(`/integrations/${provider}/login`, query);
   }
 
-  async oAuthCallback(
+  oAuthCallback(
     provider: string,
     code: string,
     state_token: string,
@@ -186,7 +202,7 @@ export default class BaseAutoGPTServerAPI {
     });
   }
 
-  async createAPIKeyCredentials(
+  createAPIKeyCredentials(
     credentials: Omit<APIKeyCredentials, "id" | "type">,
   ): Promise<APIKeyCredentials> {
     return this._request(
@@ -196,29 +212,40 @@ export default class BaseAutoGPTServerAPI {
     );
   }
 
-  async listCredentials(provider: string): Promise<CredentialsMetaResponse[]> {
-    return this._get(`/integrations/${provider}/credentials`);
+  listCredentials(provider?: string): Promise<CredentialsMetaResponse[]> {
+    return this._get(
+      provider
+        ? `/integrations/${provider}/credentials`
+        : "/integrations/credentials",
+    );
   }
 
-  async getCredentials(
+  getCredentials(
     provider: string,
     id: string,
   ): Promise<APIKeyCredentials | OAuth2Credentials> {
     return this._get(`/integrations/${provider}/credentials/${id}`);
   }
 
-  async deleteCredentials(provider: string, id: string): Promise<void> {
+  deleteCredentials(
+    provider: string,
+    id: string,
+    force: boolean = true,
+  ): Promise<
+    CredentialsDeleteResponse | CredentialsDeleteNeedConfirmationResponse
+  > {
     return this._request(
       "DELETE",
       `/integrations/${provider}/credentials/${id}`,
+      force ? { force: true } : undefined,
     );
   }
 
-  async logMetric(metric: AnalyticsMetrics) {
+  logMetric(metric: AnalyticsMetrics) {
     return this._request("POST", "/analytics/log_raw_metric", metric);
   }
 
-  async logAnalytic(analytic: AnalyticsDetails) {
+  logAnalytic(analytic: AnalyticsDetails) {
     return this._request("POST", "/analytics/log_raw_analytics", analytic);
   }
 
@@ -226,12 +253,24 @@ export default class BaseAutoGPTServerAPI {
     return this._request("GET", path, query);
   }
 
+  async createSchedule(schedule: ScheduleCreatable): Promise<Schedule> {
+    return this._request("POST", `/schedules`, schedule);
+  }
+
+  async deleteSchedule(scheduleId: string): Promise<Schedule> {
+    return this._request("DELETE", `/schedules/${scheduleId}`);
+  }
+
+  async listSchedules(): Promise<Schedule[]> {
+    return this._get(`/schedules`);
+  }
+
   private async _request(
     method: "GET" | "POST" | "PUT" | "PATCH" | "DELETE",
     path: string,
     payload?: Record<string, any>,
   ) {
-    if (method != "GET") {
+    if (method !== "GET") {
       console.debug(`${method} ${path} payload:`, payload);
     }
 
@@ -240,45 +279,101 @@ export default class BaseAutoGPTServerAPI {
         ?.access_token || "";
 
     let url = this.baseUrl + path;
-    if (method === "GET" && payload) {
+    const payloadAsQuery = ["GET", "DELETE"].includes(method);
+    if (payloadAsQuery && payload) {
       // For GET requests, use payload as query
       const queryParams = new URLSearchParams(payload);
       url += `?${queryParams.toString()}`;
     }
 
-    const hasRequestBody = method !== "GET" && payload !== undefined;
+    const hasRequestBody = !payloadAsQuery && payload !== undefined;
     const response = await fetch(url, {
       method,
-      headers: hasRequestBody
-        ? {
-            "Content-Type": "application/json",
-            Authorization: token ? `Bearer ${token}` : "",
-          }
-        : {
-            Authorization: token ? `Bearer ${token}` : "",
-          },
+      headers: {
+        ...(hasRequestBody && { "Content-Type": "application/json" }),
+        ...(token && { Authorization: `Bearer ${token}` }),
+      },
       body: hasRequestBody ? JSON.stringify(payload) : undefined,
     });
-    const response_data = await response.json();
 
     if (!response.ok) {
-      console.warn(
-        `${method} ${path} returned non-OK response:`,
-        response_data.detail,
-        response,
-      );
+      console.warn(`${method} ${path} returned non-OK response:`, response);
 
       if (
         response.status === 403 &&
-        response_data.detail === "Not authenticated" &&
-        window // Browser environment only: redirect to login page.
+        typeof window !== "undefined" // Check if in browser environment
       ) {
         window.location.href = "/login";
+        return null;
       }
 
-      throw new Error(`HTTP error ${response.status}! ${response_data.detail}`);
+      let errorDetail;
+      try {
+        const errorData = await response.json();
+        errorDetail = errorData.detail || response.statusText;
+      } catch (e) {
+        errorDetail = response.statusText;
+      }
+
+      throw new Error(errorDetail);
     }
-    return response_data;
+
+    // Handle responses with no content (like DELETE requests)
+    if (
+      response.status === 204 ||
+      response.headers.get("Content-Length") === "0"
+    ) {
+      return null;
+    }
+
+    try {
+      return await response.json();
+    } catch (e) {
+      if (e instanceof SyntaxError) {
+        console.warn(`${method} ${path} returned invalid JSON:`, e);
+        return null;
+      }
+      throw e;
+    }
+  }
+
+  startHeartbeat() {
+    this.stopHeartbeat();
+    this.heartbeatInterval = window.setInterval(() => {
+      if (this.webSocket?.readyState === WebSocket.OPEN) {
+        this.webSocket.send(
+          JSON.stringify({
+            method: "heartbeat",
+            data: "ping",
+            success: true,
+          }),
+        );
+
+        this.heartbeatTimeoutId = window.setTimeout(() => {
+          console.log("Heartbeat timeout - reconnecting");
+          this.webSocket?.close();
+          this.connectWebSocket();
+        }, this.HEARTBEAT_TIMEOUT);
+      }
+    }, this.HEARTBEAT_INTERVAL);
+  }
+
+  stopHeartbeat() {
+    if (this.heartbeatInterval) {
+      clearInterval(this.heartbeatInterval);
+      this.heartbeatInterval = null;
+    }
+    if (this.heartbeatTimeoutId) {
+      clearTimeout(this.heartbeatTimeoutId);
+      this.heartbeatTimeoutId = null;
+    }
+  }
+
+  handleHeartbeatResponse() {
+    if (this.heartbeatTimeoutId) {
+      clearTimeout(this.heartbeatTimeoutId);
+      this.heartbeatTimeoutId = null;
+    }
   }
 
   async connectWebSocket(): Promise<void> {
@@ -287,28 +382,39 @@ export default class BaseAutoGPTServerAPI {
         const token =
           (await this.supabaseClient?.auth.getSession())?.data.session
             ?.access_token || "";
-
         const wsUrlWithToken = `${this.wsUrl}?token=${token}`;
         this.webSocket = new WebSocket(wsUrlWithToken);
 
         this.webSocket.onopen = () => {
-          console.debug("WebSocket connection established");
+          console.log("WebSocket connection established");
+          this.startHeartbeat(); // Start heartbeat when connection opens
           resolve();
         };
 
         this.webSocket.onclose = (event) => {
-          console.debug("WebSocket connection closed", event);
+          console.log("WebSocket connection closed", event);
+          this.stopHeartbeat(); // Stop heartbeat when connection closes
           this.webSocket = null;
+          // Attempt to reconnect after a delay
+          setTimeout(() => this.connectWebSocket(), 1000);
         };
 
         this.webSocket.onerror = (error) => {
           console.error("WebSocket error:", error);
+          this.stopHeartbeat(); // Stop heartbeat on error
           reject(error);
         };
 
         this.webSocket.onmessage = (event) => {
           const message: WebsocketMessage = JSON.parse(event.data);
-          if (message.method == "execution_event") {
+
+          // Handle heartbeat response
+          if (message.method === "heartbeat" && message.data === "pong") {
+            this.handleHeartbeatResponse();
+            return;
+          }
+
+          if (message.method === "execution_event") {
             message.data = parseNodeExecutionResultTimestamps(message.data);
           }
           this.wsMessageHandlers[message.method]?.forEach((handler) =>
@@ -324,6 +430,7 @@ export default class BaseAutoGPTServerAPI {
   }
 
   disconnectWebSocket() {
+    this.stopHeartbeat(); // Stop heartbeat when disconnecting
     if (this.webSocket && this.webSocket.readyState === WebSocket.OPEN) {
       this.webSocket.close();
     }
@@ -380,6 +487,7 @@ type GraphCreateRequestBody =
 type WebsocketMessageTypeMap = {
   subscribe: { graph_id: string };
   execution_event: NodeExecutionResult;
+  heartbeat: "ping" | "pong";
 };
 
 type WebsocketMessage = {

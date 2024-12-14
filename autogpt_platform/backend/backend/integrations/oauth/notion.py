@@ -1,8 +1,8 @@
 from base64 import b64encode
 from urllib.parse import urlencode
 
-import requests
-from autogpt_libs.supabase_integration_credentials_store import OAuth2Credentials
+from backend.data.model import OAuth2Credentials
+from backend.util.request import requests
 
 from .base import BaseOAuthHandler
 
@@ -35,7 +35,9 @@ class NotionOAuthHandler(BaseOAuthHandler):
         }
         return f"{self.auth_base_url}?{urlencode(params)}"
 
-    def exchange_code_for_tokens(self, code: str) -> OAuth2Credentials:
+    def exchange_code_for_tokens(
+        self, code: str, scopes: list[str]
+    ) -> OAuth2Credentials:
         request_body = {
             "grant_type": "authorization_code",
             "code": code,
@@ -47,7 +49,6 @@ class NotionOAuthHandler(BaseOAuthHandler):
             "Accept": "application/json",
         }
         response = requests.post(self.token_url, json=request_body, headers=headers)
-        response.raise_for_status()
         token_data = response.json()
         # Email is only available for non-bot users
         email = (
@@ -74,6 +75,10 @@ class NotionOAuthHandler(BaseOAuthHandler):
                 "workspace_icon": token_data.get("workspace_icon"),
             },
         )
+
+    def revoke_tokens(self, credentials: OAuth2Credentials) -> bool:
+        # Notion doesn't support token revocation
+        return False
 
     def _refresh_tokens(self, credentials: OAuth2Credentials) -> OAuth2Credentials:
         # Notion doesn't support token refresh
